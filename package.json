@@ -36,6 +36,10 @@
         "title": "CAPS: Set direct Supabase API key (fallback)"
       },
       {
+        "command": "caps.setSupabaseAnonKey",
+        "title": "CAPS: Set Supabase anon key"
+      },
+      {
         "command": "caps.clearCapsSecrets",
         "title": "CAPS: Clear all stored secrets"
       }

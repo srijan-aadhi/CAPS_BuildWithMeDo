@@ -5,15 +5,17 @@ const SECRET_SNIPPETS_API_URL = 'caps.snippetsApiUrl';
 const SECRET_SNIPPETS_API_BEARER = 'caps.snippetsApiBearer';
 const SECRET_DIRECT_URL = 'caps.directSupabaseUrl';
 const SECRET_DIRECT_KEY = 'caps.directApiKey';
+const SECRET_SUPABASE_ANON_KEY = 'caps.supabaseAnonKey';
 
-/** Default Edge Function URL when unset. Uses Supabase project ref (see Dashboard → Settings → API), not the MeDo app id. Often needs CAPS: Set snippets API Bearer (anon key). */
-const DEFAULT_SNIPPETS_API_URL = 'https://zrcciaqiewveljumkcvz.supabase.co/functions/v1/snippets-api';
+const DEFAULT_REST_URL = 'https://zrcciaqiewveljumkcvz.supabase.co/rest/v1/prompts?select=id,title,prompt_text,category,tags,vote_count&order=vote_count.desc';
+// Public anon key — safe to ship in client code (role: anon, expires 2036).
+const DEFAULT_SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpyY2NpYXFpZXd2ZWxqdW1rY3Z6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzgxNjYzODcsImV4cCI6MjA5Mzc0MjM4N30.pq5tcsWHzoLQ7BvSQIbyf9Cjlgd8Vy-L-X4cfxbYYK4';
 
 type SnippetRow = {
     title: string;
     category: string;
     promptText: string;
-};
+}; 
 
 function normalizeSnippet(raw: unknown): SnippetRow | undefined {
     if (!raw || typeof raw !== 'object') {
@@ -39,34 +41,48 @@ function looksLikeHtml(body: string): boolean {
     return t.startsWith('<!doctype') || t.startsWith('<html');
 }
 
+/** Unwraps either a plain array or a { prompts: [...] } envelope. */
+function extractRows(parsed: unknown): unknown[] {
+    if (Array.isArray(parsed)) {
+        return parsed;
+    }
+    if (parsed && typeof parsed === 'object' && 'prompts' in parsed && Array.isArray((parsed as { prompts: unknown }).prompts)) {
+        return (parsed as { prompts: unknown[] }).prompts;
+    }
+    return [];
+}
+
 async function resolveFetchMode(
     secrets: vscode.SecretStorage,
     log: (m: string) => void
 ): Promise<
     { mode: 'api'; url: string; bearer?: string } | { mode: 'direct'; url: string; apiKey: string }
 > {
-    const [apiUrlSec, bearerSec, directUrlSec, directKeySec] = await Promise.all([
+    const [apiUrlSec, bearerSec, directUrlSec, directKeySec, anonKeySec] = await Promise.all([
         secrets.get(SECRET_SNIPPETS_API_URL),
         secrets.get(SECRET_SNIPPETS_API_BEARER),
         secrets.get(SECRET_DIRECT_URL),
-        secrets.get(SECRET_DIRECT_KEY)
+        secrets.get(SECRET_DIRECT_KEY),
+        secrets.get(SECRET_SUPABASE_ANON_KEY)
     ]);
 
     const apiUrl = (apiUrlSec?.trim() || process.env.CAPS_SNIPPETS_API_URL?.trim()) ?? '';
     const bearer = (bearerSec?.trim() || process.env.CAPS_SNIPPETS_API_BEARER?.trim()) || undefined;
     const directUrl = (directUrlSec?.trim() || process.env.CAPS_SNIPPETS_URL?.trim()) ?? '';
     const directKey = (directKeySec?.trim() || process.env.CAPS_API_KEY?.trim()) ?? '';
+    const anonKey = (anonKeySec?.trim() || process.env.CAPS_SUPABASE_ANON_KEY?.trim()) || undefined;
 
     if (apiUrl) {
         log(`mode=api; url from secret/env (${apiUrl.length} chars); bearer=${bearer ? 'yes' : 'no'}`);
         return { mode: 'api', url: apiUrl, bearer };
     }
     if (directUrl && directKey) {
-        log(`mode=direct Supabase REST; url (${directUrl.length} chars); key length=${directKey.length}`);
+        log(`mode=direct; url (${directUrl.length} chars); key length=${directKey.length}`);
         return { mode: 'direct', url: directUrl, apiKey: directKey };
     }
-    log(`mode=api; using built-in default URL (override with CAPS: Set snippets API URL or CAPS_SNIPPETS_API_URL)`);
-    return { mode: 'api', url: DEFAULT_SNIPPETS_API_URL, bearer };
+    const effectiveAnonKey = anonKey ?? DEFAULT_SUPABASE_ANON_KEY;
+    log(`mode=direct; using built-in Supabase REST URL; key=${anonKey ? 'from secret/env' : 'built-in default'}`);
+    return { mode: 'direct', url: DEFAULT_REST_URL, apiKey: effectiveAnonKey };
 }
 
 async function fetchSnippetRows(
@@ -82,12 +98,9 @@ async function fetchSnippetRows(
                 Authorization: `Bearer ${mode.apiKey}`
             }
         });
-        const data = res.data;
-        if (!Array.isArray(data)) {
-            throw new Error('Direct Supabase response is not a JSON array');
-        }
-        log(`direct fetch ok: ${data.length} items`);
-        return data.map(normalizeSnippet).filter((x): x is SnippetRow => x !== undefined);
+        const rows = extractRows(res.data);
+        log(`direct fetch ok: ${rows.length} items`);
+        return rows.map(normalizeSnippet).filter((x): x is SnippetRow => x !== undefined);
     }
 
     const headers: Record<string, string> = {};
@@ -115,13 +128,14 @@ async function fetchSnippetRows(
         throw new Error(msg);
     }
 
-    if (!Array.isArray(parsed)) {
-        throw new Error('Expected a JSON array of snippets from the API');
+    const rows = extractRows(parsed);
+    if (rows.length === 0 && !Array.isArray(parsed) && !(parsed && typeof parsed === 'object' && 'prompts' in parsed)) {
+        throw new Error('Expected a JSON array or { prompts: [] } envelope from the API');
     }
 
-    const rows = parsed.map(normalizeSnippet).filter((x): x is SnippetRow => x !== undefined);
-    log(`API fetch ok: ${rows.length} items (supports promptText + prompt_text)`);
-    return rows;
+    const snippets = rows.map(normalizeSnippet).filter((x): x is SnippetRow => x !== undefined);
+    log(`API fetch ok: ${snippets.length} items`);
+    return snippets;
 }
 
 export function activate(context: vscode.ExtensionContext) {
@@ -139,7 +153,7 @@ export function activate(context: vscode.ExtensionContext) {
         const value = await vscode.window.showInputBox({
             title: 'CAPS snippets API URL',
             prompt:
-                'GET URL returning JSON array (id, title, promptText, category). Clear the field and save to use built-in default. Stored securely.',
+                'GET URL returning JSON array or { prompts: [] } (title, prompt_text, category). Clear to use built-in default. Stored securely.',
             value: current,
             ignoreFocusOut: true,
             validateInput: (s) => {
@@ -168,7 +182,7 @@ export function activate(context: vscode.ExtensionContext) {
         const value = await vscode.window.showInputBox({
             title: 'CAPS API Bearer (optional)',
             prompt:
-                'Authorization Bearer for your GET (e.g. Supabase anon key for Edge Functions). Leave empty to clear.',
+                'Authorization Bearer for a custom API URL. Leave empty to clear. For the default Supabase URL, use "CAPS: Set Supabase anon key" instead.',
             password: true,
             ignoreFocusOut: true
         });
@@ -187,11 +201,35 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.window.showInformationMessage('CAPS API Bearer saved.');
     });
 
+    const setSupabaseAnonKey = vscode.commands.registerCommand('caps.setSupabaseAnonKey', async () => {
+        const value = await vscode.window.showInputBox({
+            title: 'CAPS: Supabase anon key',
+            prompt:
+                'Supabase anon/public key — find it in Supabase Dashboard → Settings → API → Project API keys → anon public. Stored securely. Also settable via CAPS_SUPABASE_ANON_KEY env var.',
+            password: true,
+            ignoreFocusOut: true,
+            validateInput: (s) => (s.trim() ? undefined : 'Enter a non-empty key')
+        });
+        if (value === undefined) {
+            return;
+        }
+        const t = value.trim();
+        if (!t) {
+            await context.secrets.delete(SECRET_SUPABASE_ANON_KEY);
+            logCaps('supabaseAnonKey cleared');
+            vscode.window.showInformationMessage('CAPS Supabase anon key cleared.');
+            return;
+        }
+        await context.secrets.store(SECRET_SUPABASE_ANON_KEY, t);
+        logCaps('supabaseAnonKey stored');
+        vscode.window.showInformationMessage('CAPS Supabase anon key saved.');
+    });
+
     const setDirectUrl = vscode.commands.registerCommand('caps.setDirectSupabaseUrl', async () => {
         const current = (await context.secrets.get(SECRET_DIRECT_URL)) ?? '';
         const value = await vscode.window.showInputBox({
             title: 'CAPS direct Supabase REST URL',
-            prompt: 'Used when no custom snippets API URL is set; overrides built-in default. Full REST URL. Stored securely.',
+            prompt: 'Full Supabase REST URL (e.g. .../rest/v1/prompts?select=...). Used when no custom API URL is set. Stored securely.',
             value: current,
             ignoreFocusOut: true,
             validateInput: (s) => (s.trim() ? undefined : 'Enter a non-empty URL')
@@ -225,6 +263,7 @@ export function activate(context: vscode.ExtensionContext) {
         await context.secrets.delete(SECRET_SNIPPETS_API_BEARER);
         await context.secrets.delete(SECRET_DIRECT_URL);
         await context.secrets.delete(SECRET_DIRECT_KEY);
+        await context.secrets.delete(SECRET_SUPABASE_ANON_KEY);
         logCaps('all CAPS secrets cleared');
         vscode.window.showInformationMessage('CAPS secrets cleared.');
     });
@@ -323,6 +362,7 @@ export function activate(context: vscode.ExtensionContext) {
         output,
         setSnippetsApiUrl,
         setSnippetsApiBearer,
+        setSupabaseAnonKey,
         setDirectUrl,
         setDirectKey,
         clearSecrets
