@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import * as path from 'path';
 import axios, { isAxiosError } from 'axios';
 
 const SECRET_SNIPPETS_API_URL = 'caps.snippetsApiUrl';
@@ -6,6 +7,19 @@ const SECRET_SNIPPETS_API_BEARER = 'caps.snippetsApiBearer';
 const SECRET_DIRECT_URL = 'caps.directSupabaseUrl';
 const SECRET_DIRECT_KEY = 'caps.directApiKey';
 const SECRET_SUPABASE_ANON_KEY = 'caps.supabaseAnonKey';
+const SECRET_ANTHROPIC_KEY = 'caps.anthropicApiKey';
+
+const BOOST_SYSTEM_PROMPT =
+    `You are an expert prompt engineer for AI coding assistants (GitHub Copilot, Claude, Cursor, etc.).
+
+Transform the user's rough or vague coding prompt into a precise, effective prompt that will produce better results from an AI coding assistant.
+
+Rules:
+- Preserve the original intent exactly
+- Be specific: mention language, framework, and context where relevant
+- Add useful constraints where appropriate (e.g. "do not install new packages", "keep existing API surface")
+- Specify expected output format when it helps (e.g. "return only the changed function")
+- Return ONLY the enhanced prompt — no explanation, no preamble, no wrapping quotes`;
 
 const DEFAULT_REST_URL = 'https://zrcciaqiewveljumkcvz.supabase.co/rest/v1/prompts?select=id,title,prompt_text,category,tags,vote_count&order=vote_count.desc';
 // Public anon key — safe to ship in client code (role: anon, expires 2036).
@@ -138,6 +152,59 @@ async function fetchSnippetRows(
     return snippets;
 }
 
+const CONTEXT_PLACEHOLDERS = ['{{selection}}', '{{filename}}', '{{filepath}}', '{{language}}'] as const;
+
+function injectContext(promptText: string, editor: vscode.TextEditor | undefined): string {
+    if (!editor) {
+        return promptText;
+    }
+    const doc = editor.document;
+    const selectedText = doc.getText(editor.selection);
+    const filename = path.basename(doc.fileName);
+    const filepath = vscode.workspace.asRelativePath(doc.fileName);
+    const language = doc.languageId;
+
+    return promptText
+        .replace(/\{\{selection\}\}/gi, selectedText)
+        .replace(/\{\{filename\}\}/gi, filename)
+        .replace(/\{\{filepath\}\}/gi, filepath)
+        .replace(/\{\{language\}\}/gi, language);
+}
+
+async function resolveAnthropicKey(secrets: vscode.SecretStorage): Promise<string> {
+    const fromSecret = await secrets.get(SECRET_ANTHROPIC_KEY);
+    return fromSecret?.trim() || process.env.CAPS_ANTHROPIC_API_KEY?.trim() || '';
+}
+
+async function callAnthropicBoost(
+    roughPrompt: string,
+    apiKey: string,
+    log: (m: string) => void
+): Promise<string> {
+    const response = await axios.post(
+        'https://api.anthropic.com/v1/messages',
+        {
+            model: 'claude-sonnet-4-6',
+            max_tokens: 1024,
+            system: BOOST_SYSTEM_PROMPT,
+            messages: [{ role: 'user', content: roughPrompt }]
+        },
+        {
+            headers: {
+                'x-api-key': apiKey,
+                'anthropic-version': '2023-06-01',
+                'content-type': 'application/json'
+            }
+        }
+    );
+    const enhanced: string = (response.data as { content?: Array<{ text?: string }> })?.content?.[0]?.text?.trim() ?? '';
+    if (!enhanced) {
+        throw new Error('Anthropic returned an empty response');
+    }
+    log(`boost ok; enhanced length=${enhanced.length}`);
+    return enhanced;
+}
+
 export function activate(context: vscode.ExtensionContext) {
     const output = vscode.window.createOutputChannel('CAPS');
     const logCaps = (message: string) => {
@@ -264,44 +331,290 @@ export function activate(context: vscode.ExtensionContext) {
         await context.secrets.delete(SECRET_DIRECT_URL);
         await context.secrets.delete(SECRET_DIRECT_KEY);
         await context.secrets.delete(SECRET_SUPABASE_ANON_KEY);
+        await context.secrets.delete(SECRET_ANTHROPIC_KEY);
         logCaps('all CAPS secrets cleared');
         vscode.window.showInformationMessage('CAPS secrets cleared.');
     });
 
+    const setAnthropicApiKey = vscode.commands.registerCommand('caps.setAnthropicApiKey', async () => {
+        const value = await vscode.window.showInputBox({
+            title: 'CAPS: Anthropic API key',
+            prompt: 'Paste your Anthropic API key (sk-ant-...). Stored securely. Also settable via CAPS_ANTHROPIC_API_KEY env var.',
+            password: true,
+            ignoreFocusOut: true
+        });
+        if (value === undefined) {
+            return;
+        }
+        const t = value.trim();
+        if (!t) {
+            await context.secrets.delete(SECRET_ANTHROPIC_KEY);
+            logCaps('anthropicApiKey cleared');
+            vscode.window.showInformationMessage('CAPS Anthropic API key cleared.');
+            return;
+        }
+        await context.secrets.store(SECRET_ANTHROPIC_KEY, t);
+        logCaps('anthropicApiKey stored');
+        vscode.window.showInformationMessage('CAPS Anthropic API key saved.');
+    });
+
+    const boostPrompt = vscode.commands.registerCommand('caps.boostPrompt', async () => {
+        const editor = vscode.window.activeTextEditor;
+        let roughPrompt = '';
+        if (editor && !editor.selection.isEmpty) {
+            roughPrompt = editor.document.getText(editor.selection).trim();
+        }
+
+        if (!roughPrompt) {
+            const input = await vscode.window.showInputBox({
+                title: 'CAPS: Boost Prompt',
+                prompt: 'Enter your rough prompt to enhance with Anthropic AI',
+                placeHolder: 'e.g. make a login form with JWT auth',
+                ignoreFocusOut: true
+            });
+            if (!input?.trim()) {
+                return;
+            }
+            roughPrompt = input.trim();
+        }
+
+        const apiKey = await resolveAnthropicKey(context.secrets);
+        if (!apiKey) {
+            const pick = await vscode.window.showErrorMessage(
+                'CAPS Boost: No Anthropic API key configured.',
+                'Set API Key'
+            );
+            if (pick === 'Set API Key') {
+                await vscode.commands.executeCommand('caps.setAnthropicApiKey');
+            }
+            return;
+        }
+
+        let enhanced = '';
+        try {
+            await vscode.window.withProgress(
+                { location: vscode.ProgressLocation.Notification, title: 'CAPS: Boosting prompt...', cancellable: false },
+                async () => {
+                    enhanced = await callAnthropicBoost(roughPrompt, apiKey, logCaps);
+                }
+            );
+        } catch (error) {
+            if (isAxiosError(error)) {
+                const status = error.response?.status;
+                const body = JSON.stringify(error.response?.data ?? '').slice(0, 300);
+                logCaps(`boost command HTTP error: status=${status}; body=${body}`);
+                vscode.window.showErrorMessage(`CAPS Boost failed (HTTP ${status ?? 'unknown'}). Check CAPS output channel.`);
+            } else {
+                logCaps(`boost command error: ${String(error)}`);
+                vscode.window.showErrorMessage(`CAPS Boost failed: ${String(error)}`);
+            }
+            output.show(true);
+            return;
+        }
+
+        const finalPrompt = await vscode.window.showInputBox({
+            title: 'CAPS: Boosted Prompt',
+            prompt: 'Edit if needed — press Enter to open in inline chat, Escape to copy to clipboard',
+            value: enhanced,
+            ignoreFocusOut: true
+        });
+
+        if (finalPrompt === undefined) {
+            await vscode.env.clipboard.writeText(enhanced);
+            vscode.window.showInformationMessage('CAPS: Enhanced prompt copied to clipboard.');
+            return;
+        }
+        if (finalPrompt.trim()) {
+            await vscode.commands.executeCommand('caps.openInlineChat', finalPrompt.trim());
+        }
+    });
+
+    const codeLensEmitter = new vscode.EventEmitter<void>();
+    const codeLensProvider = vscode.languages.registerCodeLensProvider(
+        { scheme: 'file', language: '*' },
+        {
+            onDidChangeCodeLenses: codeLensEmitter.event,
+            provideCodeLenses(document): vscode.CodeLens[] {
+                const editor = vscode.window.activeTextEditor;
+                if (!editor || editor.document !== document || editor.selection.isEmpty) {
+                    return [];
+                }
+                const line = editor.selection.start.line;
+                return [new vscode.CodeLens(new vscode.Range(line, 0, line, 0), {
+                    title: '$(sparkle) Boost with CAPS',
+                    command: 'caps.boostPrompt',
+                    tooltip: 'Enhance selected text as a prompt with Anthropic AI'
+                })];
+            }
+        }
+    );
+    const selectionListener = vscode.window.onDidChangeTextEditorSelection(() => {
+        codeLensEmitter.fire();
+    });
+
+    const chatParticipant = vscode.chat.createChatParticipant(
+        'caps.assistant',
+        async (request, _chatCtx, stream, _token) => {
+            const roughPrompt = request.prompt.trim();
+            if (!roughPrompt) {
+                stream.markdown(
+                    'Type a rough prompt after `@caps` and I\'ll enhance it for inline chat.\n\n' +
+                    '**Example:** `@caps make a login form with JWT auth`'
+                );
+                return;
+            }
+
+            const apiKey = await resolveAnthropicKey(context.secrets);
+            if (!apiKey) {
+                stream.markdown(
+                    '**CAPS Boost** needs an Anthropic API key.\n\n' +
+                    'Run **CAPS: Set Anthropic API key** from the Command Palette (`Ctrl+Shift+P`) and paste your key.'
+                );
+                stream.button({ command: 'caps.setAnthropicApiKey', title: '$(key) Set Anthropic API key' });
+                return;
+            }
+
+            stream.progress('Enhancing with Anthropic...');
+            try {
+                const enhanced = await callAnthropicBoost(roughPrompt, apiKey, logCaps);
+                stream.markdown(`**Enhanced prompt:**\n\n\`\`\`\n${enhanced}\n\`\`\``);
+                stream.button({ command: 'caps.openInlineChat', arguments: [enhanced], title: '$(sparkle) Open in Inline Chat' });
+            } catch (error) {
+                if (isAxiosError(error)) {
+                    const status = error.response?.status;
+                    const body = JSON.stringify(error.response?.data ?? '').slice(0, 300);
+                    logCaps(`boost participant HTTP error: status=${status}; body=${body}`);
+                    if (status === 401) {
+                        stream.markdown('**CAPS Boost**: Invalid or expired Anthropic API key. Re-run **CAPS: Set Anthropic API key** to update it.');
+                        stream.button({ command: 'caps.setAnthropicApiKey', title: '$(key) Update API key' });
+                    } else {
+                        stream.markdown(`**CAPS Boost**: Anthropic API error (HTTP ${status ?? 'unknown'}). Check the CAPS output channel for details.`);
+                    }
+                } else {
+                    logCaps(`boost participant error: ${String(error)}`);
+                    stream.markdown(`**CAPS Boost**: ${String(error)}`);
+                }
+            }
+        }
+    );
+    chatParticipant.iconPath = new vscode.ThemeIcon('sparkle');
+
+    const pickPrompt = vscode.commands.registerCommand('caps.pickPrompt', async () => {
+        // Snapshot context immediately — before any async UI that could lose the selection.
+        const editor = vscode.window.activeTextEditor;
+        const snapshot = editor
+            ? {
+                selectedText: editor.document.getText(editor.selection),
+                filename: path.basename(editor.document.fileName),
+                filepath: vscode.workspace.asRelativePath(editor.document.fileName),
+                language: editor.document.languageId
+            }
+            : null;
+
+        type PromptItem = vscode.QuickPickItem & { promptText: string };
+
+        // Show the picker immediately so the user gets instant feedback.
+        const qp = vscode.window.createQuickPick<PromptItem>();
+        qp.title = 'CAPS: Pick a prompt';
+        qp.placeholder = 'Loading…';
+        qp.matchOnDescription = true;
+        qp.busy = true;
+        qp.show();
+
+        try {
+            const cfg = await resolveFetchMode(context.secrets, logCaps);
+            const rows = await fetchSnippetRows(cfg, logCaps);
+            qp.items = rows.map(s => ({
+                label: s.title,
+                description: s.category,
+                detail: s.promptText.length > 120 ? s.promptText.slice(0, 120) + '…' : s.promptText,
+                promptText: s.promptText
+            }));
+            qp.placeholder = rows.length === 0 ? 'No prompts found in library' : 'Search by title or category…';
+            qp.busy = false;
+        } catch (error) {
+            qp.hide();
+            qp.dispose();
+            logCaps(`pickPrompt fetch error: ${String(error)}`);
+            vscode.window.showErrorMessage('CAPS failed to fetch prompts. Check CAPS output channel.');
+            output.show(true);
+            return;
+        }
+
+        const picked = await new Promise<PromptItem | undefined>(resolve => {
+            qp.onDidAccept(() => resolve(qp.selectedItems[0]));
+            qp.onDidHide(() => resolve(undefined));
+        });
+        qp.dispose();
+
+        if (!picked) {
+            return;
+        }
+
+        let injected = picked.promptText;
+        if (snapshot) {
+            injected = injected
+                .replace(/\{\{selection\}\}/gi, snapshot.selectedText)
+                .replace(/\{\{filename\}\}/gi, snapshot.filename)
+                .replace(/\{\{filepath\}\}/gi, snapshot.filepath)
+                .replace(/\{\{language\}\}/gi, snapshot.language);
+        }
+
+        logCaps(`pickPrompt: "${picked.label}"; context injected=${injected !== picked.promptText}`);
+        await vscode.commands.executeCommand('caps.openInlineChat', injected);
+    });
+
+    const openInlineChatWithContext = vscode.commands.registerCommand(
+        'caps.openInlineChatWithContext',
+        async (promptText: string) => {
+            const editor = vscode.window.activeTextEditor;
+            const injected = injectContext(promptText, editor);
+            if (injected !== promptText) {
+                logCaps(`context injected: ${promptText.length} → ${injected.length} chars`);
+            }
+            await vscode.commands.executeCommand('caps.openInlineChat', injected);
+        }
+    );
+
     const openInlineChat = vscode.commands.registerCommand('caps.openInlineChat', async (promptText: string) => {
-        const attempts: Array<{ command: string; args: any[] }> = [
+        // Copy to clipboard first — guaranteed fallback if prefill is silently ignored.
+        await vscode.env.clipboard.writeText(promptText);
+
+        // Show notification NOW — inlineChat.start blocks until the chat is closed,
+        // so anything shown after the await is invisible while the chat is open.
+        vscode.window.showInformationMessage('CAPS: Prompt copied — Ctrl+V to paste it in.');
+
+        // Try known prefill argument shapes across VS Code versions.
+        const prefillAttempts: Array<{ command: string; args: unknown[] }> = [
+            { command: 'inlineChat.start', args: [{ initialInput: promptText, autoSend: false }] },
             { command: 'inlineChat.start', args: [{ message: promptText, autoSend: false }] },
-            { command: 'inlineChat.start', args: [{ prompt: promptText, autoSend: false }] },
-            { command: 'inlineChat.start', args: [promptText] },
+            { command: 'inlineChat.start', args: [{ query: promptText, autoSend: false }] },
+            { command: 'editor.action.inlineChat.start', args: [{ initialInput: promptText, autoSend: false }] },
             { command: 'editor.action.inlineChat.start', args: [{ message: promptText, autoSend: false }] },
-            { command: 'editor.action.inlineChat.start', args: [{ prompt: promptText, autoSend: false }] },
-            { command: 'editor.action.inlineChat.start', args: [promptText] }
+            { command: 'editor.action.inlineChat.start', args: [{ query: promptText, autoSend: false }] },
         ];
 
-        for (const attempt of attempts) {
+        for (const { command, args } of prefillAttempts) {
             try {
-                await vscode.commands.executeCommand(attempt.command, ...attempt.args);
+                await vscode.commands.executeCommand(command, ...args);
                 return;
             } catch {
-                // Try next command/argument shape.
+                // Try next shape.
             }
         }
 
-        try {
-            await vscode.commands.executeCommand('inlineChat.start');
-            return;
-        } catch {
-            // Try alternate command id used in some builds.
+        // All prefill attempts threw; open inline chat bare.
+        for (const command of ['inlineChat.start', 'editor.action.inlineChat.start']) {
+            try {
+                await vscode.commands.executeCommand(command);
+                return;
+            } catch {
+                // Try next.
+            }
         }
 
-        try {
-            await vscode.commands.executeCommand('editor.action.inlineChat.start');
-            return;
-        } catch {
-            await vscode.env.clipboard.writeText(promptText);
-            await vscode.commands.executeCommand('workbench.action.chat.open');
-            vscode.window.showWarningMessage('Could not prefill inline chat. Prompt copied to clipboard and chat opened.');
-        }
+        // Last resort: sidebar chat.
+        await vscode.commands.executeCommand('workbench.action.chat.open');
     });
 
     const provider = vscode.languages.registerCompletionItemProvider(
@@ -326,13 +639,19 @@ export function activate(context: vscode.ExtensionContext) {
                         item.detail = `[CAPS] ${s.category}`;
                         item.insertText = '';
                         item.command = {
-                            command: 'caps.openInlineChat',
+                            command: 'caps.openInlineChatWithContext',
                             title: 'Open Inline Chat',
                             arguments: [s.promptText]
                         };
-                        item.documentation = new vscode.MarkdownString(
-                            `**Category:** ${s.category}\n\n${s.promptText}`
+                        const usedPlaceholders = CONTEXT_PLACEHOLDERS.filter(p =>
+                            s.promptText.toLowerCase().includes(p.toLowerCase())
                         );
+                        let docContent = `**Category:** ${s.category}`;
+                        if (usedPlaceholders.length > 0) {
+                            docContent += `\n\n*Auto-injects: ${usedPlaceholders.join(', ')}*`;
+                        }
+                        docContent += `\n\n${s.promptText}`;
+                        item.documentation = new vscode.MarkdownString(docContent);
                         return item;
                     });
                 } catch (error) {
@@ -365,6 +684,14 @@ export function activate(context: vscode.ExtensionContext) {
         setSupabaseAnonKey,
         setDirectUrl,
         setDirectKey,
-        clearSecrets
+        clearSecrets,
+        pickPrompt,
+        openInlineChatWithContext,
+        setAnthropicApiKey,
+        boostPrompt,
+        codeLensEmitter,
+        codeLensProvider,
+        selectionListener,
+        chatParticipant
     );
 }

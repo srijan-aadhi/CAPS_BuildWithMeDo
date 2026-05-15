@@ -40,10 +40,44 @@
         "title": "CAPS: Set Supabase anon key"
       },
       {
+        "command": "caps.setAnthropicApiKey",
+        "title": "CAPS: Set Anthropic API key"
+      },
+      {
+        "command": "caps.pickPrompt",
+        "title": "CAPS: Pick Prompt"
+      },
+      {
+        "command": "caps.boostPrompt",
+        "title": "CAPS: Boost Prompt",
+        "icon": "$(sparkle)"
+      },
+      {
         "command": "caps.clearCapsSecrets",
         "title": "CAPS: Clear all stored secrets"
       }
-    ]
+    ],
+    "chatParticipants": [
+      {
+        "id": "caps.assistant",
+        "name": "caps",
+        "description": "Boost a rough prompt with Anthropic AI before sending to inline chat",
+        "isSticky": false
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "caps.pickPrompt",
+          "group": "caps@1"
+        },
+        {
+          "command": "caps.boostPrompt",
+          "when": "editorHasSelection",
+          "group": "caps@2"
+        }
+      ]
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run package",
