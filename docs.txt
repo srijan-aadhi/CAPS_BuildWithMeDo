@@ -51,6 +51,25 @@ DONE (VS Code extension, current codebase)
     enhanced prompt in editable input box before firing to inline chat.
   - CodeLens: "Boost with CAPS" lens appears above selected text in editor.
   - Credential: CAPS_ANTHROPIC_API_KEY env var or "CAPS: Set Anthropic API key".
+- Context injection: prompts use {{selection}}, {{filename}}, {{filepath}}, {{language}}
+  placeholders. Extension snapshots editor context before any async UI opens, then
+  substitutes before handoff to inline chat. Works in both //? completion and
+  caps.pickPrompt command paths.
+- Fuzzy search / filter:
+  - caps.pickPrompt QuickPick: matchOnDescription + matchOnDetail enabled; prompts
+    grouped by category with separators; tags shown in description row; searching
+    matches title, category, tags, and prompt body preview.
+  - //? completion: filterText per item encodes title + category + tags so typing
+    after the trigger filters the list beyond just the title.
+- Keyboard-first navigation: satisfied natively — QuickPick supports arrow keys +
+  Enter; //? completion widget supports full keyboard navigation out of the box.
+- Recently used / favorites: last 5 picks stored in globalState; surfaced as a
+  "Recently Used" separator section at the top of caps.pickPrompt QuickPick; sorted
+  to the top of the //? completion list via sortText. Both trigger paths (QuickPick
+  and //? completion) update the list on accept via caps.completionAccepted.
+- Simplified trigger: @@ typed anywhere in an editor opens caps.pickPrompt QuickPick
+  immediately (onDidChangeTextDocument listener detects @@, deletes the two chars,
+  fires the command). //? completion trigger kept alongside for backwards compat.
 
 ARCHITECTURE DECISION (2026-05-12)
 - MeDo web app is deployed but HTTP routing to it from the extension is broken
@@ -63,34 +82,7 @@ PARTIALLY DONE / IN PROGRESS
 - (none currently)
 
 NOT STARTED (roadmap — prioritized)
-1. CONTEXT INJECTION (highest value)
-   When a prompt is selected from the //? list, automatically inject context into it
-   before sending to inline chat:
-   - Selected code in the editor → inserted into the prompt as a code block
-   - Current file name + language → appended so the AI knows the context
-   - Pattern: prompts use placeholders like {{selection}} or {{filename}} that the
-     extension fills before handoff.
-   Why: a prompt like "Refactor using our BaseService pattern" becomes far more useful
-   when it also sends the function the developer is looking at.
-
-2. FUZZY SEARCH / FILTER ON TRIGGER (high value)
-   Instead of a flat dropdown on //?, let the user type //refactor or //debug to
-   pre-filter the list. Completion items filtered by title + tags as the user types.
-   Why: a library of 50+ prompts is useless if finding the right one takes scrolling.
-
-3. KEYBOARD-FIRST NAVIGATION
-   Arrow keys + Enter to select a snippet without reaching for the mouse.
-   Why: the whole point is staying in flow; mouse navigation breaks it.
-
-4. RECENTLY USED / FAVORITES
-   Track the last N prompts used (locally); surface them at the top of the //? list.
-   Why: most developers use 5-10 prompts repeatedly. Instant re-access matters.
-
-5. SIMPLIFIED TRIGGER
-   Evaluate replacing //? with // (no ?) or a dedicated prefix like @@.
-   Why: //? is three characters and non-obvious to new users; discoverability matters.
-
-6. TEAM PROMPT MAINTENANCE (MeDo side)
+1. TEAM PROMPT MAINTENANCE (MeDo side)
    Versioning, "mark as official", deprecation notices shown inline in the dropdown.
    Why: if the library has stale prompts it loses trust. Teams need a way to flag
    the canonical, maintained prompts vs. personal experiments.
@@ -103,8 +95,12 @@ KNOWN TECHNICAL CAVEATS
   unknown reason. Workaround is direct Supabase REST (in place). Root cause unresolved.
 - Supabase anon key is hardcoded as a default constant (public key, safe to ship);
   override via secret storage or env var if the key rotates.
-- VS Code inline chat input is not accessible to extensions — no API to read or write
-  the text typed there. This is a hard platform constraint, not a workaround situation.
+- VS Code inline chat input text cannot be set programmatically from an extension.
+  inlineChat.start with initialInput/message args is silently ignored when VS Code
+  detects a code action at the cursor (shows "Fix the problem" instead). The fire-
+  and-forget + selectAll + type approach was attempted but did not work reliably.
+  Current workaround: selection is cleared and cursor nudged off diagnostics before
+  opening inline chat; prompt is copied to clipboard; user presses Ctrl+A, Ctrl+V.
 
 ================================================================================
 VISION SUMMARY (revised)

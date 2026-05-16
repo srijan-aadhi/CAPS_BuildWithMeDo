@@ -28,8 +28,9 @@ const DEFAULT_SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3Mi
 type SnippetRow = {
     title: string;
     category: string;
+    tags: string[];
     promptText: string;
-}; 
+};
 
 function normalizeSnippet(raw: unknown): SnippetRow | undefined {
     if (!raw || typeof raw !== 'object') {
@@ -47,7 +48,13 @@ function normalizeSnippet(raw: unknown): SnippetRow | undefined {
     if (!title && !promptText) {
         return undefined;
     }
-    return { title, category, promptText };
+    const rawTags = s.tags;
+    const tags: string[] = Array.isArray(rawTags)
+        ? rawTags.filter((t): t is string => typeof t === 'string')
+        : typeof rawTags === 'string' && rawTags.trim()
+          ? rawTags.split(',').map(t => t.trim()).filter(Boolean)
+          : [];
+    return { title, category, tags, promptText };
 }
 
 function looksLikeHtml(body: string): boolean {
@@ -153,6 +160,19 @@ async function fetchSnippetRows(
 }
 
 const CONTEXT_PLACEHOLDERS = ['{{selection}}', '{{filename}}', '{{filepath}}', '{{language}}'] as const;
+
+const RECENT_KEY = 'caps.recentlyUsed';
+const RECENT_MAX = 5;
+
+function getRecentPrompts(state: vscode.Memento): SnippetRow[] {
+    return state.get<SnippetRow[]>(RECENT_KEY, []);
+}
+
+async function addRecentPrompt(state: vscode.Memento, row: SnippetRow): Promise<void> {
+    const current = getRecentPrompts(state);
+    const deduped = current.filter(r => r.title !== row.title);
+    await state.update(RECENT_KEY, [row, ...deduped].slice(0, RECENT_MAX));
+}
 
 function injectContext(promptText: string, editor: vscode.TextEditor | undefined): string {
     if (!editor) {
@@ -511,26 +531,59 @@ export function activate(context: vscode.ExtensionContext) {
             }
             : null;
 
-        type PromptItem = vscode.QuickPickItem & { promptText: string };
+        type PromptItem = vscode.QuickPickItem & { promptText: string; row?: SnippetRow };
 
         // Show the picker immediately so the user gets instant feedback.
         const qp = vscode.window.createQuickPick<PromptItem>();
         qp.title = 'CAPS: Pick a prompt';
         qp.placeholder = 'Loading…';
         qp.matchOnDescription = true;
+        qp.matchOnDetail = true;
         qp.busy = true;
         qp.show();
 
         try {
             const cfg = await resolveFetchMode(context.secrets, logCaps);
             const rows = await fetchSnippetRows(cfg, logCaps);
-            qp.items = rows.map(s => ({
-                label: s.title,
-                description: s.category,
-                detail: s.promptText.length > 120 ? s.promptText.slice(0, 120) + '…' : s.promptText,
-                promptText: s.promptText
-            }));
-            qp.placeholder = rows.length === 0 ? 'No prompts found in library' : 'Search by title or category…';
+            const recent = getRecentPrompts(context.globalState);
+
+            const toItem = (s: SnippetRow): PromptItem => {
+                const tagPart = s.tags.length > 0 ? ` · ${s.tags.join(', ')}` : '';
+                const preview = s.promptText.length > 110 ? s.promptText.slice(0, 110) + '…' : s.promptText;
+                return {
+                    label: s.title,
+                    description: `${s.category}${tagPart}`,
+                    detail: preview,
+                    promptText: s.promptText,
+                    row: s
+                };
+            };
+
+            const items: PromptItem[] = [];
+
+            if (recent.length > 0) {
+                items.push({ label: 'Recently Used', kind: vscode.QuickPickItemKind.Separator, promptText: '' });
+                for (const r of recent) {
+                    items.push(toItem(r));
+                }
+            }
+
+            // Group remaining by category, sort categories alphabetically.
+            const grouped = new Map<string, SnippetRow[]>();
+            for (const row of rows) {
+                const cat = row.category || 'Uncategorized';
+                if (!grouped.has(cat)) { grouped.set(cat, []); }
+                grouped.get(cat)!.push(row);
+            }
+            for (const cat of [...grouped.keys()].sort((a, b) => a.localeCompare(b))) {
+                items.push({ label: cat, kind: vscode.QuickPickItemKind.Separator, promptText: '' });
+                for (const s of grouped.get(cat)!) {
+                    items.push(toItem(s));
+                }
+            }
+
+            qp.items = items;
+            qp.placeholder = rows.length === 0 ? 'No prompts found in library' : 'Search by title, category, tags, or prompt text…';
             qp.busy = false;
         } catch (error) {
             qp.hide();
@@ -547,9 +600,11 @@ export function activate(context: vscode.ExtensionContext) {
         });
         qp.dispose();
 
-        if (!picked) {
+        if (!picked || !picked.row) {
             return;
         }
+
+        await addRecentPrompt(context.globalState, picked.row);
 
         let injected = picked.promptText;
         if (snapshot) {
@@ -576,44 +631,50 @@ export function activate(context: vscode.ExtensionContext) {
         }
     );
 
+    // Fired by the //? completion on accept — records the pick then opens inline chat.
+    const completionAccepted = vscode.commands.registerCommand(
+        'caps.completionAccepted',
+        async (row: SnippetRow) => {
+            await addRecentPrompt(context.globalState, row);
+            logCaps(`completion accepted: "${row.title}"`);
+            await vscode.commands.executeCommand('caps.openInlineChatWithContext', row.promptText);
+        }
+    );
+
     const openInlineChat = vscode.commands.registerCommand('caps.openInlineChat', async (promptText: string) => {
-        // Copy to clipboard first — guaranteed fallback if prefill is silently ignored.
+        // Keep clipboard as fallback in case the type command misfires.
         await vscode.env.clipboard.writeText(promptText);
 
-        // Show notification NOW — inlineChat.start blocks until the chat is closed,
-        // so anything shown after the await is invisible while the chat is open.
-        vscode.window.showInformationMessage('CAPS: Prompt copied — Ctrl+V to paste it in.');
+        // Collapse selection and nudge cursor off any diagnostic so VS Code doesn't
+        // override the inline chat input with "Fix the problem".
+        const editor = vscode.window.activeTextEditor;
+        if (editor) {
+            let safePos = editor.selection.active;
+            if (!editor.selection.isEmpty) {
+                safePos = editor.selection.start;
+                editor.selection = new vscode.Selection(safePos, safePos);
+            }
+            const diagnostics = vscode.languages.getDiagnostics(editor.document.uri);
+            const onDiag = diagnostics.some(d => d.range.contains(safePos));
+            if (onDiag) {
+                const lineStart = new vscode.Position(safePos.line, 0);
+                editor.selection = new vscode.Selection(lineStart, lineStart);
+            }
+        }
 
-        // Try known prefill argument shapes across VS Code versions.
-        const prefillAttempts: Array<{ command: string; args: unknown[] }> = [
-            { command: 'inlineChat.start', args: [{ initialInput: promptText, autoSend: false }] },
-            { command: 'inlineChat.start', args: [{ message: promptText, autoSend: false }] },
-            { command: 'inlineChat.start', args: [{ query: promptText, autoSend: false }] },
-            { command: 'editor.action.inlineChat.start', args: [{ initialInput: promptText, autoSend: false }] },
-            { command: 'editor.action.inlineChat.start', args: [{ message: promptText, autoSend: false }] },
-            { command: 'editor.action.inlineChat.start', args: [{ query: promptText, autoSend: false }] },
+        vscode.window.showInformationMessage('CAPS: Prompt copied — Ctrl+A, Ctrl+V to paste it in.');
+
+        const chatCmds: Array<[string, unknown[]]> = [
+            ['inlineChat.start', [{ initialInput: promptText, autoSend: false }]],
+            ['inlineChat.start', [{ message: promptText, autoSend: false }]],
+            ['editor.action.inlineChat.start', [{ initialInput: promptText, autoSend: false }]],
+            ['editor.action.inlineChat.start', [{ message: promptText, autoSend: false }]],
+            ['inlineChat.start', []],
+            ['editor.action.inlineChat.start', []],
         ];
-
-        for (const { command, args } of prefillAttempts) {
-            try {
-                await vscode.commands.executeCommand(command, ...args);
-                return;
-            } catch {
-                // Try next shape.
-            }
+        for (const [cmd, args] of chatCmds) {
+            try { await vscode.commands.executeCommand(cmd, ...args); return; } catch { }
         }
-
-        // All prefill attempts threw; open inline chat bare.
-        for (const command of ['inlineChat.start', 'editor.action.inlineChat.start']) {
-            try {
-                await vscode.commands.executeCommand(command);
-                return;
-            } catch {
-                // Try next.
-            }
-        }
-
-        // Last resort: sidebar chat.
         await vscode.commands.executeCommand('workbench.action.chat.open');
     });
 
@@ -633,20 +694,26 @@ export function activate(context: vscode.ExtensionContext) {
 
                 try {
                     const rows = await fetchSnippetRows(cfg, logCaps);
+                    const recentTitles = new Set(getRecentPrompts(context.globalState).map(r => r.title));
 
                     return rows.map((s) => {
                         const item = new vscode.CompletionItem(s.title, vscode.CompletionItemKind.Snippet);
                         item.detail = `[CAPS] ${s.category}`;
+                        item.filterText = [s.title, s.category, ...s.tags].join(' ');
+                        item.sortText = recentTitles.has(s.title) ? `0_${s.title}` : `1_${s.title}`;
                         item.insertText = '';
                         item.command = {
-                            command: 'caps.openInlineChatWithContext',
+                            command: 'caps.completionAccepted',
                             title: 'Open Inline Chat',
-                            arguments: [s.promptText]
+                            arguments: [s]
                         };
                         const usedPlaceholders = CONTEXT_PLACEHOLDERS.filter(p =>
                             s.promptText.toLowerCase().includes(p.toLowerCase())
                         );
                         let docContent = `**Category:** ${s.category}`;
+                        if (s.tags.length > 0) {
+                            docContent += `  \n**Tags:** ${s.tags.join(', ')}`;
+                        }
                         if (usedPlaceholders.length > 0) {
                             docContent += `\n\n*Auto-injects: ${usedPlaceholders.join(', ')}*`;
                         }
@@ -675,6 +742,32 @@ export function activate(context: vscode.ExtensionContext) {
         '?'
     );
 
+    // Detect @@ typed in any editor and open the QuickPick immediately.
+    const atAtListener = vscode.workspace.onDidChangeTextDocument(async (event) => {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor || editor.document !== event.document) { return; }
+
+        for (const change of event.contentChanges) {
+            if (change.text !== '@') { continue; }
+
+            const col = change.range.start.character;
+            if (col < 1) { continue; }
+
+            // After the insert, check whether the character just before the new @ is also @.
+            const lineText = editor.document.lineAt(change.range.start.line).text;
+            if (lineText[col - 1] !== '@') { continue; }
+
+            // Delete the @@ then open the QuickPick.
+            const deleteRange = new vscode.Range(
+                change.range.start.line, col - 1,
+                change.range.start.line, col + 1
+            );
+            await editor.edit(eb => eb.delete(deleteRange));
+            await vscode.commands.executeCommand('caps.pickPrompt');
+            break;
+        }
+    });
+
     context.subscriptions.push(
         provider,
         openInlineChat,
@@ -687,11 +780,13 @@ export function activate(context: vscode.ExtensionContext) {
         clearSecrets,
         pickPrompt,
         openInlineChatWithContext,
+        completionAccepted,
         setAnthropicApiKey,
         boostPrompt,
         codeLensEmitter,
         codeLensProvider,
         selectionListener,
-        chatParticipant
+        chatParticipant,
+        atAtListener
     );
 }
