@@ -70,6 +70,11 @@ DONE (VS Code extension, current codebase)
 - Simplified trigger: @@ typed anywhere in an editor opens caps.pickPrompt QuickPick
   immediately (onDidChangeTextDocument listener detects @@, deletes the two chars,
   fires the command). //? completion trigger kept alongside for backwards compat.
+- Prompt caching: 60-second in-memory cache (SnippetCacheEntry in activate closure)
+  shared by both the QuickPick and //? completion paths. Cache keyed by fetch config
+  fingerprint — auto-invalidates if API URL or credentials change. QuickPick title
+  shows "(cached Xs ago)" or "(refreshed)" so cache state is visible. CAPS output
+  channel auto-shown on activation (output.show(false)); all fetch/cache events logged.
 
 ARCHITECTURE DECISION (2026-05-12)
 - MeDo web app is deployed but HTTP routing to it from the extension is broken

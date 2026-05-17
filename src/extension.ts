@@ -159,6 +159,8 @@ async function fetchSnippetRows(
     return snippets;
 }
 
+const CACHE_TTL_MS = 60_000;
+
 const CONTEXT_PLACEHOLDERS = ['{{selection}}', '{{filename}}', '{{filepath}}', '{{language}}'] as const;
 
 const RECENT_KEY = 'caps.recentlyUsed';
@@ -233,7 +235,27 @@ export function activate(context: vscode.ExtensionContext) {
         output.appendLine(line);
     };
 
+    output.show(false);
     logCaps('activate');
+
+    type SnippetCacheEntry = { rows: SnippetRow[]; fetchedAt: number; modeKey: string };
+    let snippetCache: SnippetCacheEntry | null = null;
+
+    function invalidateCache() { snippetCache = null; }
+
+    async function fetchCached(): Promise<SnippetRow[]> {
+        const cfg = await resolveFetchMode(context.secrets, logCaps);
+        const modeKey = cfg.mode === 'api' ? cfg.url : cfg.url + cfg.apiKey;
+        const now = Date.now();
+        if (snippetCache && snippetCache.modeKey === modeKey && now - snippetCache.fetchedAt < CACHE_TTL_MS) {
+            logCaps(`cache hit; age=${Math.round((now - snippetCache.fetchedAt) / 1000)}s`);
+            return snippetCache.rows;
+        }
+        const rows = await fetchSnippetRows(cfg, logCaps);
+        snippetCache = { rows, fetchedAt: now, modeKey };
+        logCaps(`cache updated; ${rows.length} rows`);
+        return rows;
+    }
 
     const setSnippetsApiUrl = vscode.commands.registerCommand('caps.setSnippetsApiUrl', async () => {
         const current = (await context.secrets.get(SECRET_SNIPPETS_API_URL)) ?? '';
@@ -256,11 +278,13 @@ export function activate(context: vscode.ExtensionContext) {
         }
         if (!value.trim()) {
             await context.secrets.delete(SECRET_SNIPPETS_API_URL);
+            invalidateCache();
             logCaps('snippetsApiUrl cleared — using built-in default');
             vscode.window.showInformationMessage('CAPS snippets API URL cleared; using built-in default.');
             return;
         }
         await context.secrets.store(SECRET_SNIPPETS_API_URL, value.trim());
+        invalidateCache();
         logCaps('snippetsApiUrl stored');
         vscode.window.showInformationMessage('CAPS snippets API URL saved.');
     });
@@ -279,11 +303,13 @@ export function activate(context: vscode.ExtensionContext) {
         const t = value.trim();
         if (!t) {
             await context.secrets.delete(SECRET_SNIPPETS_API_BEARER);
+            invalidateCache();
             logCaps('snippetsApiBearer cleared');
             vscode.window.showInformationMessage('CAPS API Bearer cleared.');
             return;
         }
         await context.secrets.store(SECRET_SNIPPETS_API_BEARER, t);
+        invalidateCache();
         logCaps('snippetsApiBearer stored');
         vscode.window.showInformationMessage('CAPS API Bearer saved.');
     });
@@ -303,11 +329,13 @@ export function activate(context: vscode.ExtensionContext) {
         const t = value.trim();
         if (!t) {
             await context.secrets.delete(SECRET_SUPABASE_ANON_KEY);
+            invalidateCache();
             logCaps('supabaseAnonKey cleared');
             vscode.window.showInformationMessage('CAPS Supabase anon key cleared.');
             return;
         }
         await context.secrets.store(SECRET_SUPABASE_ANON_KEY, t);
+        invalidateCache();
         logCaps('supabaseAnonKey stored');
         vscode.window.showInformationMessage('CAPS Supabase anon key saved.');
     });
@@ -325,6 +353,7 @@ export function activate(context: vscode.ExtensionContext) {
             return;
         }
         await context.secrets.store(SECRET_DIRECT_URL, value.trim());
+        invalidateCache();
         logCaps('direct Supabase URL stored');
         vscode.window.showInformationMessage('CAPS direct URL saved.');
     });
@@ -341,6 +370,7 @@ export function activate(context: vscode.ExtensionContext) {
             return;
         }
         await context.secrets.store(SECRET_DIRECT_KEY, value.trim());
+        invalidateCache();
         logCaps('direct API key stored');
         vscode.window.showInformationMessage('CAPS direct API key saved.');
     });
@@ -352,6 +382,7 @@ export function activate(context: vscode.ExtensionContext) {
         await context.secrets.delete(SECRET_DIRECT_KEY);
         await context.secrets.delete(SECRET_SUPABASE_ANON_KEY);
         await context.secrets.delete(SECRET_ANTHROPIC_KEY);
+        invalidateCache();
         logCaps('all CAPS secrets cleared');
         vscode.window.showInformationMessage('CAPS secrets cleared.');
     });
@@ -543,8 +574,12 @@ export function activate(context: vscode.ExtensionContext) {
         qp.show();
 
         try {
-            const cfg = await resolveFetchMode(context.secrets, logCaps);
-            const rows = await fetchSnippetRows(cfg, logCaps);
+            const cacheAgeBefore = snippetCache ? Date.now() - snippetCache.fetchedAt : null;
+            const rows = await fetchCached();
+            const fromCache = cacheAgeBefore !== null && cacheAgeBefore < CACHE_TTL_MS;
+            qp.title = fromCache
+                ? `CAPS: Pick a prompt  (cached ${Math.round(cacheAgeBefore! / 1000)}s ago)`
+                : 'CAPS: Pick a prompt  (refreshed)';
             const recent = getRecentPrompts(context.globalState);
 
             const toItem = (s: SnippetRow): PromptItem => {
@@ -690,10 +725,8 @@ export function activate(context: vscode.ExtensionContext) {
 
                 logCaps('completion //?');
 
-                const cfg = await resolveFetchMode(context.secrets, logCaps);
-
                 try {
-                    const rows = await fetchSnippetRows(cfg, logCaps);
+                    const rows = await fetchCached();
                     const recentTitles = new Set(getRecentPrompts(context.globalState).map(r => r.title));
 
                     return rows.map((s) => {
